@@ -79,24 +79,28 @@ def home():
     logging.debug("🌐 Flask / endpoint pinged.")
     return "✅ Discord-Telegram Model List Bot is running."
 
-async def main():
-    try:
-        # Start Discord client in background
-        asyncio.create_task(discord_client.start(DISCORD_TOKEN))
+async def start_telegram_bot():
+    telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    telegram_app.add_handler(CommandHandler("start", telegram_start))
+    logging.info("✅ Telegram bot initialized.")
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling()
+    logging.info("✅ Telegram bot polling started.")
+    # Keep it running indefinitely
+    await telegram_app.updater.wait()
 
-        # Start Telegram bot
-        telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        telegram_app.add_handler(CommandHandler("start", telegram_start))
-        logging.info("✅ Telegram bot ready and waiting for commands.")
-        await telegram_app.run_polling()
-    except Exception as e:
-        logging.error("❌ Error in main async loop:\n" + traceback.format_exc())
+async def main():
+    # Start both bots in shared loop
+    discord_task = asyncio.create_task(discord_client.start(DISCORD_TOKEN))
+    telegram_task = asyncio.create_task(start_telegram_bot())
+    await asyncio.gather(discord_task, telegram_task)
 
 if __name__ == "__main__":
     import threading
 
-    # Start Flask web server in a thread (optional)
+    # Flask in separate thread (optional for pings)
     threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=WEB_PORT)).start()
 
-    # Start async main loop (Discord + Telegram)
+    # Async bots
     asyncio.run(main())

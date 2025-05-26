@@ -1,6 +1,5 @@
 import os
 import asyncio
-import datetime
 import discord
 from discord.utils import get
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -8,12 +7,13 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
 from flask import Flask, request
 from threading import Thread
+from collections import defaultdict
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 DISCORD_TOKEN    = os.environ['DISCORD_TOKEN']
@@ -44,6 +44,11 @@ CATEGORIES_TO_INCLUDE = [
 ]
 # ────────────────────────────────────────────────────────────────────────────
 
+# ─── Concurrency Safeguards ─────────────────────────────────────────────────
+fetch_semaphore = asyncio.Semaphore(2)
+chat_locks = defaultdict(lambda: asyncio.Lock())
+# ────────────────────────────────────────────────────────────────────────────
+
 # ─── Discord client ────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.guilds = True
@@ -67,82 +72,98 @@ def split_chunks(text: str, limit: int = 4000):
         chunks.append(current)
     return chunks
 
-async def fetch_and_send_channels(chat_id: int, bot):
-    guild = discord_client.get_guild(DISCORD_GUILD_ID)
-    if not guild:
-        await bot.send_message(chat_id, "❌ Guild not found.")
-        return
+async def clear_previous_list(chat_id, bot, ctx):
+    prev_ids = ctx.chat_data.get('last_msg_ids', [])
+    for msg_id in prev_ids:
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except:
+            pass
+    ctx.chat_data['last_msg_ids'] = []
 
-    out = []
-    for cat_name in CATEGORIES_TO_INCLUDE:
-        cat = get(guild.categories, name=cat_name)
-        if not cat:
-            continue
-        out.append(f"```\n{cat_name}```")
-        for ch in cat.text_channels:
-            out.append(f"`• {ch.name}`")
-        out.append("")
-
-    if not out:
-        await bot.send_message(chat_id, "⚠️ No matching categories found.")
-        return
-
-    full = "\n".join(out)
-    for chunk in split_chunks(full):
-        await bot.send_message(chat_id, chunk, parse_mode='Markdown')
-
-async def send_footer(chat_id: int, bot):
-    last_updated = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-    footer_text = (
-        f"Last updated: {last_updated}\n"
-        "If you don't see your model, when you purchase VIP let us know and we'll add it ASAP!"
-    )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton('🔄 Refresh', callback_data='refresh')],
-        [InlineKeyboardButton('💳 Join VIP', url='https://t.me/VIPPaymentBot')]
-    ])
-    await bot.send_message(chat_id, footer_text, reply_markup=keyboard)
-
-# Handlers
-async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def fetch_and_send_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    bot = ctx.bot
-    # instant loading message
-    await bot.send_message(chat_id, "⏳ Loading Model channels please wait, this could take 2–5 mins…")
-    # fetch and send
-    await fetch_and_send_channels(chat_id, bot)
-    # footer with buttons
-    await send_footer(chat_id, bot)
+    # concurrency locks
+    async with fetch_semaphore, chat_locks[chat_id]:
+        # clear old
+        await clear_previous_list(chat_id, ctx.bot, ctx)
+        out = []
+        guild = discord_client.get_guild(DISCORD_GUILD_ID)
+        if not guild:
+            msg = await update.message.reply_text("❌ Guild not found.")
+            return ctx.chat_data.setdefault('last_msg_ids', []).append(msg.message_id)
 
+        for cat_name in CATEGORIES_TO_INCLUDE:
+            cat = get(guild.categories, name=cat_name)
+            if not cat:
+                continue
+            out.append(f"{cat_name}")
+            for ch in cat.text_channels:
+                out.append(f"• {ch.name}")
+            out.append("")
+
+        if not out:
+            msg = await update.message.reply_text("⚠️ No matching categories found.")
+            return ctx.chat_data.setdefault('last_msg_ids', []).append(msg.message_id)
+
+        full = "\n".join(out)
+        sent_ids = []
+        for i, chunk in enumerate(split_chunks(full)):
+            code = f"```\n{chunk}```"
+            msg = await update.message.reply_markdown(code)
+            sent_ids.append(msg.message_id)
+        # footer + buttons
+        from datetime import datetime
+        footer = (
+            "If you don’t see the model you want, let us know when you purchase VIP and we’ll add them ASAP!\n"
+            f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
+            InlineKeyboardButton("💰 Join VIP", url="https://t.me/YourVIPBotPlaceholder")
+        ]])
+        msg2 = await update.message.reply_text(footer, reply_markup=keyboard)
+        sent_ids.append(msg2.message_id)
+        ctx.chat_data['last_msg_ids'] = sent_ids
+
+# /start
+async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # initial prompt
+    init = await update.message.reply_text(
+        "⏳ Loading Model channels please wait, this could take 2–5 mins…"
+    )
+    ctx.chat_data['last_msg_ids'] = [init.message_id]
+    await fetch_and_send_channels(update, ctx)
+
+# /refresh via command
+async def refresh_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await fetch_and_send_channels(update, ctx)
+
+# via button callback
 async def refresh_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    bot = ctx.bot
-    chat_id = query.message.chat_id
-    # acknowledge callback (ignore timeout)
-    try:
-        await query.answer()
-    except:
-        pass
-    # clear previous bot messages in chat
-    async for msg in bot.get_chat(chat_id).history(limit=100):
-        if msg.from_user and msg.from_user.id == bot.id:
-            await msg.delete()
-    # resend
-    await fetch_and_send_channels(chat_id, bot)
-    await send_footer(chat_id, bot)
+    await update.callback_query.answer()
+    dummy = Update(
+        update.callback_query.update_id,
+        message=update.callback_query.message
+    )
+    # reuse same message object
+    await fetch_and_send_channels(dummy, ctx)
 
+# catch-all
 async def help_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 I only understand /start and /refresh to fetch the model list."
     )
 
-# register handlers
-tg_app.add_handler(CommandHandler('start', start_handler))
-tg_app.add_handler(CallbackQueryHandler(refresh_callback, pattern='^refresh$'))
-# fallback for text
-tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, help_prompt))
+tg_app.add_handler(CommandHandler("start", start_handler))
+tg_app.add_handler(CommandHandler("refresh", refresh_handler))
+tg_app.add_handler(CallbackQueryHandler(refresh_callback, pattern="^refresh$"))
+tg_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, help_prompt)
+)
+# ────────────────────────────────────────────────────────────────────────────
 
-# ─── Flask webhook server ───────────────────────────────────────────────────
+# ─── Flask webserver for webhook ───────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route('/', methods=['GET', 'HEAD'])
@@ -152,22 +173,26 @@ def home():
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json(force=True)
-    upd = Update.de_json(data, tg_app.bot)
+    upd  = Update.de_json(data, tg_app.bot)
     tg_app.update_queue.put_nowait(upd)
     return 'OK'
+# ────────────────────────────────────────────────────────────────────────────
 
 async def set_webhook():
     await tg_app.bot.set_webhook(WEBHOOK_URL)
 
 async def main():
-    # start Flask thread
-    Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000))), daemon=True).start()
-    # telegram webhook
+    # start Telegram
     await tg_app.initialize()
     await tg_app.start()
     await set_webhook()
-    # start discord
+    # start Discord
     await discord_client.start(DISCORD_TOKEN)
 
 if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    Thread(
+        target=lambda: app.run(host='0.0.0.0', port=port, debug=False),
+        daemon=True
+    ).start()
     asyncio.run(main())

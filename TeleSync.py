@@ -7,6 +7,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
     filters,
@@ -112,7 +113,7 @@ async def do_refresh(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     # 2) fetch & send the actual chunks in a pre block
     chunks = await build_channel_listing()
     for idx, chunk in enumerate(chunks):
-        header = "" if idx==0 else "*(continued)*\n"
+        header = "" if idx == 0 else "*(continued)*\n"
         msg = await bot.send_message(
             chat_id=chat_id,
             text=f"```\n{header}{chunk}\n```",
@@ -128,34 +129,32 @@ async def do_refresh(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     ]])
     footer = await bot.send_message(
         chat_id=chat_id,
-        text=f"Last updated on {ts}\n\nIf your model isn’t listed yet, buy VIP & let us know which one you want added !",
+        text=(
+            f"Last updated on {ts}\n\n"
+            "If your model isn’t listed yet, buy VIP & let us know which one you want added !"
+        ),
         reply_markup=keyboard
     )
     last_messages[chat_id].append(footer.message_id)
 
-# Handlers
+# ─── Handlers ───────────────────────────────────────────────────────────────
 async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await do_refresh(chat_id, ctx)
+    await do_refresh(update.effective_chat.id, ctx)
 
 async def refresh_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    chat_id = update.effective_chat.id
-    await do_refresh(chat_id, ctx)
+    await do_refresh(update.effective_chat.id, ctx)
 
 async def help_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 I only understand /start and the 🔄 Refresh button to update the model list."
+        "🤖 I only understand /start or the 🔄 Refresh button to fetch the model list."
     )
 
-# register with Telegram
 tg_app.add_handler(CommandHandler("start", start_handler))
 tg_app.add_handler(CallbackQueryHandler(refresh_callback, pattern="^refresh$"))
-tg_app.add_handler(
-    # catch any plain‐text message
-    CommandHandler("refresh", lambda u, c: start_handler(u, c))
-)
+tg_app.add_handler(CommandHandler("refresh", start_handler))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, help_prompt))
+# ────────────────────────────────────────────────────────────────────────────
 
 # ─── Flask webserver for Telegram webhook ─────────────────────────────────
 app = Flask(__name__)
@@ -176,15 +175,15 @@ async def set_webhook():
     await tg_app.bot.set_webhook(WEBHOOK_URL)
 
 async def main():
-    # Telegram
+    # start Telegram side
     await tg_app.initialize()
     await tg_app.start()
     await set_webhook()
-    # Discord
+    # then Discord
     await discord_client.start(DISCORD_TOKEN)
 
 if __name__ == '__main__':
-    # run Flask in a background thread
+    # bind to Render’s $PORT (default 5000 locally)
     port = int(os.environ.get('PORT', 5000))
     Thread(
         target=lambda: app.run(host='0.0.0.0', port=port, debug=False),

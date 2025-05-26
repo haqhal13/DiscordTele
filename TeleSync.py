@@ -1,121 +1,133 @@
+# bot.py
+
 import os
 import threading
 import asyncio
-import discord
 import logging
-from flask import Flask
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+
+import discord
+from flask import Flask, request
+
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, CommandHandler
 from dotenv import load_dotenv
 
-# === Load environment variables ===
+# ─── CONFIG ─────────────────────────────────────────────────────────────────────
+
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID"))
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEB_PORT = int(os.getenv("PORT", 10000))
+# Discord
+DISCORD_TOKEN      = os.environ["DISCORD_TOKEN"]
+DISCORD_GUILD_ID   = int(os.environ["DISCORD_GUILD_ID"])
 
-# === Category filter ===
+# Telegram
+TELEGRAM_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
+WEBHOOK_URL        = os.environ["WEBHOOK_URL"]   # e.g. https://myapp.example.com
+WEB_PORT           = int(os.environ.get("PORT", 3000))
+
+# Only include these Discord categories:
 CATEGORIES_TO_INCLUDE = [
-    '📦 ETHNICITY VAULTS',
-    '🧔 MALE CREATORS / AGENCY',
-    '💪 HGF',
-    '🎥 NET VIDEO GIRLS',
-    '🇨🇳 ASIAN .1',
-    '🇨🇳 ASIAN .2',
-    '🇲🇽 LATINA .1',
-    '🇲🇽 LATINA .2',
-    '❄ SNOWBUNNIE .1',
-    '❄ SNOWBUNNIE .2',
-    '🇮🇳 INDIAN / DESI',
-    '🇸🇦 ARAB',
-    '🧬 MIXED / LIGHTSKIN',
-    '🏴 BLACK',
-    '🌺 POLYNESIAN',
-    '☠ GOTH / ALT',
-    '🏦 VAULT BANKS',
-    '🔞 PORN',
+    '📦 ETHNICITY VAULTS', '🧔 MALE CREATORS / AGENCY', '💪 HGF',
+    '🎥 NET VIDEO GIRLS', '🇨🇳 ASIAN .1', '🇨🇳 ASIAN .2',
+    '🇲🇽 LATINA .1', '🇲🇽 LATINA .2', '❄ SNOWBUNNIE .1',
+    '❄ SNOWBUNNIE .2', '🇮🇳 INDIAN / DESI', '🇸🇦 ARAB',
+    '🧬 MIXED / LIGHTSKIN', '🏴 BLACK', '🌺 POLYNESIAN',
+    '☠ GOTH / ALT', '🏦 VAULT BANKS', '🔞 PORN',
     'Uncatagorised Girls'
 ]
 
-# === Logging configuration ===
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
+# ─── LOGGING ───────────────────────────────────────────────────────────────────
 
-# === Discord client setup ===
-intents = discord.Intents.default()
-intents.guilds = True
-client = discord.Client(intents=intents)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
-# Create a single event loop for Discord
-discord_loop = asyncio.new_event_loop()
+# ─── DISCORD CLIENT ────────────────────────────────────────────────────────────
 
-def start_discord_loop():
+discord_loop   = asyncio.new_event_loop()
+discord_client = discord.Client(intents=discord.Intents(guilds=True))
+
+def start_discord():
+    """Run Discord client in its own loop/thread."""
     asyncio.set_event_loop(discord_loop)
-    discord_loop.run_until_complete(client.start(DISCORD_TOKEN))
+    discord_loop.run_until_complete(discord_client.start(DISCORD_TOKEN))
 
-@client.event
+@discord_client.event
 async def on_ready():
-    logging.info(f"✅ Discord connected: {client.user} (ID: {client.user.id})")
+    logging.info(f"✅ Discord ready as {discord_client.user} (ID {discord_client.user.id})")
 
 async def fetch_discord_channels():
-    await client.wait_until_ready()
-    guild = client.get_guild(DISCORD_GUILD_ID)
+    """Fetch and format the filtered channel list for Telegram."""
+    guild = discord_client.get_guild(DISCORD_GUILD_ID)
     if not guild:
-        logging.error("❌ Guild not found!")
-        return "Error: Guild not found."
+        logging.error("❌ Discord guild not found!")
+        return "Error: Discord guild not found."
+
     logging.info(f"✅ Found guild: {guild.name}")
-    output = ""
-    for category in guild.categories:
-        if category.name not in CATEGORIES_TO_INCLUDE:
-            logging.debug(f"⏭ Skipping category {category.name}")
+    out = []
+    for cat in guild.categories:
+        if cat.name not in CATEGORIES_TO_INCLUDE:
+            logging.debug(f"⏭ Skipping category {cat.name}")
             continue
-        logging.debug(f"📂 Category: {category.name}")
-        output += f"\n📂 {category.name}\n"
-        for ch in category.channels:
+        logging.debug(f"📂 Including category {cat.name}")
+        out.append(f"📂 {cat.name}")
+        for ch in cat.channels:
             if isinstance(ch, discord.TextChannel):
-                logging.debug(f"   - Channel: {ch.name}")
-                output += f"   - {ch.name}\n"
-    return output.strip() or "No channels found."
+                logging.debug(f"   - {ch.name}")
+                out.append(f"   – {ch.name}")
+    return "\n".join(out) if out else "No channels found."
 
-# === Telegram handler ===
+# ─── TELEGRAM BOT & DISPATCHER ─────────────────────────────────────────────────
 
-def start_command(update: Update, context: CallbackContext):
+bot        = Bot(token=TELEGRAM_TOKEN)
+dispatcher = Dispatcher(bot, None, use_context=True, workers=4)
+
+def start_handler(update: Update, context):
     user = update.effective_user
-    logging.info(f"🚀 /start triggered by {user.username} ({user.id})")
-    update.message.reply_text("⏳ Fetching latest model list...")
+    logging.info(f"🚀 /start by {user.username} ({user.id})")
+    update.message.reply_text("⏳ Fetching latest model list…")
+
+    # run Discord fetch in Discord's loop
+    future = asyncio.run_coroutine_threadsafe(fetch_discord_channels(), discord_loop)
     try:
-        future = asyncio.run_coroutine_threadsafe(fetch_discord_channels(), discord_loop)
-        data = future.result(timeout=30)
-        msg = f"📋 **Model List:**\n\n{data}\n\n💸 Pay here: https://t.me/YourPaymentBot"
-        update.message.reply_text(msg, parse_mode="Markdown")
+        data = future.result(timeout=20)
+        resp = f"📋 **Model List**:\n\n{data}\n\n💸 Pay here: https://t.me/YourPaymentBot"
+        update.message.reply_text(resp, parse_mode="Markdown")
         logging.info("✅ Sent model list to Telegram.")
-    except Exception:
-        logging.exception("❌ Error fetching/sending model list")
+    except Exception as e:
+        logging.exception("❌ Failed to fetch/send model list")
         update.message.reply_text("❌ Failed to fetch model list.")
 
-# === Flask health check ===
+dispatcher.add_handler(CommandHandler("start", start_handler))
+
+# ─── FLASK WEBHOOK APP ─────────────────────────────────────────────────────────
+
 app = Flask(__name__)
-@app.route('/')
-def home():
-    logging.info("🌐 Healthcheck ping")
-    return "OK"
 
-# === Main entrypoint ===
-if __name__ == '__main__':
-    # Start Discord in its own thread/event loop
-    threading.Thread(target=start_discord_loop, daemon=True).start()
+@app.route("/", methods=["GET", "HEAD"])
+def health():
+    return "OK", 200
 
-    # Start Flask server for health checks
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=WEB_PORT), daemon=True).start()
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    """Receive Telegram updates via webhook."""
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "OK", 200
 
-    # Initialize Telegram bot (PTB v13)
-    updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
-    dispatcher = updater.dispatcher
-    # Clear any previous webhook and start polling
-    updater.bot.delete_webhook()
-    logging.info("✅ Cleared previous Telegram webhook; switching to polling.")
-    dispatcher.add_handler(CommandHandler('start', start_command))
-    logging.info("✅ Telegram bot initialized, polling started.")
-    updater.start_polling()
-    updater.idle()
+# ─── MAIN ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # 1) Launch Discord client
+    threading.Thread(target=start_discord, daemon=True).start()
+
+    # 2) Configure Telegram webhook
+    bot.delete_webhook()
+    webhook_endpoint = f"{WEBHOOK_URL}/webhook"
+    bot.set_webhook(webhook_endpoint)
+    logging.info(f"✅ Telegram webhook set to {webhook_endpoint}")
+
+    # 3) Run Flask server (health + webhook)
+    logging.info(f"🌐 Starting Flask on port {WEB_PORT}")
+    app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)

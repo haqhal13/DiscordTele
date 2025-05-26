@@ -1,10 +1,11 @@
 import os
+import threading
 import asyncio
 import discord
 import logging
 from flask import Flask
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Updater, CommandHandler, CallbackContext
 from dotenv import load_dotenv
 
 # === LOAD ENVIRONMENT ===
@@ -15,7 +16,6 @@ DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEB_PORT = int(os.getenv("PORT", 10000))
 
-# === CATEGORY FILTER ===
 CATEGORIES_TO_INCLUDE = [
     '📦 ETHNICITY VAULTS',
     '🧔 MALE CREATORS / AGENCY',
@@ -38,7 +38,7 @@ CATEGORIES_TO_INCLUDE = [
     'Uncatagorised Girls'
 ]
 
-# === LOGGING CONFIGURATION ===
+# === LOGGING CONFIG ===
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # === DISCORD CLIENT ===
@@ -53,62 +53,62 @@ async def on_ready():
 async def fetch_discord_channels():
     try:
         await client.wait_until_ready()
-        logging.debug("🔍 Checking for guild and categories...")
+        logging.debug("🔍 Checking for guild...")
         guild = client.get_guild(DISCORD_GUILD_ID)
         if not guild:
-            logging.error("❌ Discord guild not found!")
+            logging.error("❌ Guild not found")
             return "Error: Guild not found."
         logging.info(f"✅ Found guild: {guild.name} ({guild.id})")
 
-        result = ""
+        output = ""
         for category in guild.categories:
             if category.name not in CATEGORIES_TO_INCLUDE:
-                logging.debug(f"⏭ Skipping category: {category.name}")
+                logging.debug(f"⏭ Skipping category {category.name}")
                 continue
-            logging.debug(f"📂 Processing category: {category.name}")
-            result += f"\n📂 {category.name}\n"
+            logging.debug(f"📂 Processing category {category.name}")
+            output += f"\n📂 {category.name}\n"
             for ch in category.channels:
                 if isinstance(ch, discord.TextChannel):
-                    logging.debug(f"   - Found channel: {ch.name}")
-                    result += f"   - {ch.name}\n"
-        return result.strip() or "No channels found."
+                    logging.debug(f"   - {ch.name}")
+                    output += f"   - {ch.name}\n"
+        return output.strip() or "No channels found."
     except Exception:
-        logging.exception("❌ Exception in fetch_discord_channels")
+        logging.exception("❌ Error fetching channels")
         return "Error fetching channels."
 
-# === TELEGRAM BOT ===
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === TELEGRAM HANDLER ===
+def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
     logging.info(f"🚀 /start from {user.username} ({user.id})")
-    await update.message.reply_text("⏳ Fetching latest model list...")
-    data = await fetch_discord_channels()
-    msg = f"📋 **Current Model List:**\n\n{data}\n\n💸 Pay here: https://t.me/YourPaymentBot"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-    logging.info("✅ Sent model list to Telegram.")
+    update.message.reply_text("⏳ Fetching model list...")
+    try:
+        future = asyncio.run_coroutine_threadsafe(fetch_discord_channels(), discord_loop)
+        data = future.result(timeout=30)
+        message = f"📋 **Model List:**\n\n{data}\n\n💸 Pay: https://t.me/YourPaymentBot"
+        update.message.reply_text(message, parse_mode="Markdown")
+        logging.info("✅ Sent model list to Telegram.")
+    except Exception:
+        logging.exception("❌ Error sending model list")
+        update.message.reply_text("❌ Failed to fetch list.")
 
 # === FLASK HEALTHCHECK ===
 app = Flask(__name__)
 @app.route('/')
 def home():
-    logging.info("🌐 Healthcheck pinged.")
+    logging.info("🌐 Healthcheck")
     return "OK"
 
 # === MAIN ===
-async def main():
-    logging.info("🚀 Starting bots...")
-    # Start Discord
-    discord_task = asyncio.create_task(client.start(DISCORD_TOKEN))
-    # Start Telegram
-    tg_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start_command))
-    logging.info("✅ Telegram initialized.")
-    # Run polling without closing loop
-    telegram_task = asyncio.create_task(tg_app.run_polling(close_loop=False))
-    await asyncio.gather(discord_task, telegram_task)
-
 if __name__ == '__main__':
-    import threading
-    # Start Flask in thread
+    # Start Flask
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=WEB_PORT)).start()
-    # Run async
-    asyncio.run(main())
+    # Start Discord in thread
+    discord_loop = asyncio.new_event_loop()
+    threading.Thread(target=lambda: discord_loop.run_until_complete(client.start(DISCORD_TOKEN))).start()
+    # Start Telegram PTB v13
+    updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler('start', start_command))
+    logging.info("✅ Telegram initialized")
+    updater.start_polling()
+    updater.idle()

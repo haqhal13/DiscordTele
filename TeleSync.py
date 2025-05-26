@@ -7,26 +7,20 @@ from dotenv import load_dotenv
 
 import discord
 from discord import Intents
-
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ─── Config & Logging ─────────────────────────────────────────────────────────
-
+# Load environment
 load_dotenv()
-DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-WEBHOOK_URL     = os.environ["WEBHOOK_URL"]    # e.g. https://your-app.onrender.com
-PORT            = int(os.environ.get("PORT", 8443))
-GUILD_ID        = int(os.environ["GUILD_ID"])
+DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+GUILD_ID = int(os.environ["GUILD_ID"])
 
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Categories to include
 CATEGORIES_TO_INCLUDE = [
     '📦 ETHNICITY VAULTS',
     '🧔 MALE CREATORS  / AGENCY',
@@ -49,15 +43,18 @@ CATEGORIES_TO_INCLUDE = [
     'Uncatagorised Girls'
 ]
 
+# Store last sent message IDs
 _last_messages: dict[int, list[int]] = {}
 
-# ─── Discord Client ───────────────────────────────────────────────────────────
-
+# Discord client
 intents = Intents.default()
 intents.guilds = True
+intents.messages = False
+
 discord_client = discord.Client(intents=intents)
 
 async def fetch_model_list() -> str:
+    """Fetch and format the channel list from Discord."""
     guild = discord_client.get_guild(GUILD_ID)
     if guild is None:
         await discord_client.wait_until_ready()
@@ -75,9 +72,8 @@ async def fetch_model_list() -> str:
         lines.append("")
     return "\n".join(lines)
 
-# ─── Telegram Helpers ─────────────────────────────────────────────────────────
-
 async def _delete_old(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Delete previous messages to keep chat clean."""
     ids = _last_messages.pop(chat_id, [])
     for m_id in ids:
         try:
@@ -87,13 +83,16 @@ async def _delete_old(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _send_list(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     text = await fetch_model_list()
+    # Split into parts avoiding Telegram limits
     parts, curr = [], ""
     for line in text.split("\n"):
         if len(curr) + len(line) + 1 > 3900:
-            parts.append(curr); curr = line + "\n"
+            parts.append(curr)
+            curr = line + "\n"
         else:
             curr += line + "\n"
-    if curr: parts.append(curr)
+    if curr:
+        parts.append(curr)
 
     await _delete_old(chat_id, ctx)
     sent_ids = []
@@ -111,14 +110,13 @@ async def _send_list(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id,
         text=(
             f"Our list is above (updated {ts}).\n"
-            "Press /refresh again to update."
+            "Press /refresh to update."
         )
     )
     sent_ids.append(footer.message_id)
     _last_messages[chat_id] = sent_ids
 
-# ─── Command Handlers ────────────────────────────────────────────────────────
-
+# Telegram handlers
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     await ctx.bot.send_message(
@@ -135,25 +133,16 @@ async def refresh_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_message(chat_id=cid, text="🔄 Refreshing list…")
     await _send_list(cid, ctx)
 
-# ─── Main Entrypoint ─────────────────────────────────────────────────────────
-
 async def main():
+    # Start Discord bot in background
     asyncio.create_task(discord_client.start(DISCORD_TOKEN))
-
-    app = (ApplicationBuilder()
-           .token(TELEGRAM_TOKEN)
-           .build())
+    
+    # Build and run Telegram polling
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
-
-    await app.bot.set_webhook(WEBHOOK_URL + "/webhook")
-
-    await app.start_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_path="/webhook"
-    )
-    await app.idle()
+    
+    await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())

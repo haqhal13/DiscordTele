@@ -1,117 +1,126 @@
 import os
-import asyncio
-import logging
-from datetime import datetime
+import threading
 from flask import Flask, request
-from telegram import Update, Bot
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes
 import discord
 from discord import Intents
 
-# Configuration
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-GUILD_ID = int(os.getenv("DISCORD_GUILD_ID"))
+# Load environment variables
+DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+DISCORD_GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", 0))
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+PORT = int(os.environ.get("PORT", 10000))
 
+# Categories to include
 CATEGORIES_TO_INCLUDE = [
-    '📦 ETHNICITY VAULTS', '🧔 MALE CREATORS  / AGENCY', '💪 HGF',
-    '🎥 NET VIDEO GIRLS', '🇨🇳 ASIAN .1', '🇨🇳 ASIAN .2',
-    '🇲🇽 LATINA .1', '🇲🇽 LATINA .2', '❄ SNOWBUNNIE .1', '❄ SNOWBUNNIE .2',
-    '🇮🇳 INDIAN / DESI', '🇸🇦 ARAB', '🧬 MIXED / LIGHTSKIN', '🏴 BLACK',
-    '🌺 POLYNESIAN', '☠ GOTH / ALT', '🏦 VAULT BANKS', '🔞 PORN',
-    'Uncatagorised Girls'
+    '📦 ETHNICITY VAULTS', '🧔 MALE CREATORS  / AGENCY', '💪 HGF', '🎥 NET VIDEO GIRLS',
+    '🇨🇳 ASIAN .1', '🇨🇳 ASIAN .2', '🇲🇽 LATINA .1', '🇲🇽 LATINA .2',
+    '❄ SNOWBUNNIE .1', '❄ SNOWBUNNIE .2', '🇮🇳 INDIAN / DESI', '🇸🇦 ARAB',
+    '🧬 MIXED / LIGHTSKIN', '🏴 BLACK', '🌺 POLYNESIAN', '☠ GOTH / ALT',
+    '🏦 VAULT BANKS', '🔞 PORN', 'Uncatagorised Girls'
 ]
 
-logging.basicConfig(level=logging.INFO)
+# Initialize Flask app for Telegram webhook
 app = Flask(__name__)
 
-discord_client = discord.Client(intents=Intents.default())
+# Initialize Discord client
+intents = Intents.default()
+discord_client = discord.Client(intents=intents)
 
-@discord_client.event
-async def on_ready():
-    logging.info(f"✅ Discord logged in as {discord_client.user}")
+# Telegram: generate and format model list message
+def build_model_list():
+    guild = discord_client.get_guild(DISCORD_GUILD_ID)
+    if not guild:
+        return "❌ Couldn't find the configured Discord guild."
 
-# Telegram handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # initial welcome prompt
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="👋 Hi there! Type /start or /refresh to receive an up-to-date model list."
-    )
-
-async def fetch_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, is_refresh=False):
-    chat_id = update.effective_chat.id
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text="⏳ Fetching Model channels please wait, this could take 2–5 mins…"
-    )
-
-    guild = discord_client.get_guild(GUILD_ID)
-    if guild is None:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg.message_id,
-            text="❌ Could not fetch channels: Guild not found"
-        )
-        return
-
+    # Collect channels under desired categories
     lines = []
     for category in guild.categories:
         if category.name in CATEGORIES_TO_INCLUDE:
-            lines.append(f"<b>{category.name}</b>")
-            for ch in category.text_channels:
-                lines.append(f"• {ch.name}")
-            lines.append("")
+            for ch in category.channels:
+                prefix = '•'
+                lines.append(f"{prefix} {ch.name}")
 
     if not lines:
-        text = "❌ No matching categories found"
-    else:
-        timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-        text = "\n".join(lines)
-        text += f"\nUpdated: {timestamp}\nType /refresh to refresh the list."
+        return "🚫 No channels found in the specified categories."
 
-    # replace message
-    await context.bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=msg.message_id,
-        text=text,
+    # Header with timestamp
+    header = f"<b>Model Channels (updated)</b>\n"
+    body = "\n".join(lines)
+    return header + body
+
+# Telegram: /start and /refresh handler
+def make_intro_keyboard():
+    kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]]
+    return InlineKeyboardMarkup(kb)
+
+async def start_or_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # On first /start or /refresh, clear previous messages
+    chat_id = update.effective_chat.id
+    # Send waiting message
+    waiting = await context.bot.send_message(
+        chat_id,
+        "⏳ Fetching Model channels please wait, this could take 2–5 mins…",
         parse_mode='HTML'
     )
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await fetch_and_send(update, context)
+    # Build the list (may be slow)
+    text = build_model_list()
 
-async def refresh_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    await fetch_and_send(update, context, is_refresh=True)
+    # Delete waiting message
+    await waiting.delete()
 
-# Flask endpoint for Telegram webhook
+    # Send the list with refresh button
+    await context.bot.send_message(
+        chat_id,
+        text,
+        parse_mode='HTML',
+        reply_markup=make_intro_keyboard()
+    )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == 'refresh':
+        # Treat refresh same as start
+        await start_or_refresh(update, context)
+
+# Telegram setup
+def setup_telegram(app_obj: Application):
+    app_obj.add_handler(CommandHandler('start', start_or_refresh))
+    app_obj.add_handler(CommandHandler('refresh', start_or_refresh))
+    app_obj.add_handler(CommandHandler('help', start_or_refresh))
+    app_obj.add_handler(telegram.ext.CallbackQueryHandler(button_callback))
+
+# Flask route for Telegram webhook
 @app.route('/webhook', methods=['POST'])
-async def webhook():
-    data = request.get_json()
-    update = Update.de_json(data, Bot(TELEGRAM_TOKEN))
-    await telegram_app.update_queue.put(update)
+def telegram_webhook():
+    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+    telegram_app.update_queue.put(update)
     return 'OK'
 
+# Discord event handlers
+@discord_client.event
+async def on_ready():
+    print(f"✅ Discord logged in as {discord_client.user} (ID: {discord_client.user.id})")
+
+# Main entry
 if __name__ == '__main__':
-    # Start Discord
-    asyncio.create_task(discord_client.start(DISCORD_TOKEN))
+    # Telegram bot
+    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    setup_telegram(telegram_app)
+    # Set Telegram webhook
+    telegram_app.bot.set_webhook(WEBHOOK_URL + '/webhook')
 
-    # Build Telegram app
-    telegram_app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .build()
+    # Run Flask in background
+    flask_thread = threading.Thread(
+        target=app.run,
+        kwargs={'host': '0.0.0.0', 'port': PORT}
     )
-    telegram_app.add_handler(CommandHandler('start', start_handler))
-    telegram_app.add_handler(CommandHandler('refresh', refresh_handler))
+    flask_thread.daemon = True
+    flask_thread.start()
 
-    # Set webhook
-    asyncio.get_event_loop().create_task(
-        telegram_app.bot.set_webhook(WEBHOOK_URL + '/webhook')
-    )
-
-    # Run Flask
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 10000)))
-
+    # Finally, run Discord client (blocks)
+    discord_client.run(DISCORD_TOKEN)

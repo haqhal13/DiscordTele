@@ -1,4 +1,4 @@
-# TeleSync.py
+#!/usr/bin/env python3
 import os
 import asyncio
 import discord
@@ -8,7 +8,6 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
     filters,
 )
@@ -21,8 +20,6 @@ DISCORD_TOKEN    = os.environ['DISCORD_TOKEN']
 DISCORD_GUILD_ID = int(os.environ['DISCORD_GUILD_ID'])
 TELEGRAM_TOKEN   = os.environ['TELEGRAM_BOT_TOKEN']
 WEBHOOK_URL      = os.environ['WEBHOOK_URL'].rstrip('/') + '/webhook'
-
-VIP_URL = "https://t.me/YourVIPPaymentBot"  # replace with your VIP link
 
 CATEGORIES_TO_INCLUDE = [
     '📦 ETHNICITY VAULTS',
@@ -57,32 +54,24 @@ discord_client = discord.Client(intents=intents)
 tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 # ────────────────────────────────────────────────────────────────────────────
 
-# per-chat locks & message tracking
-chat_locks = {}
-chat_messages = {}
+# store last batch of message_ids per chat so we can delete on refresh
+last_messages = {}
 
 def split_chunks(text: str, limit: int = 4000):
     lines = text.splitlines(keepends=True)
     chunks, current = [], ""
     for line in lines:
         if len(current) + len(line) > limit:
-            chunks.append(current); current = line
+            chunks.append(current)
+            current = line
         else:
             current += line
     if current:
         chunks.append(current)
     return chunks
 
-async def cleanup_chat(chat_id: int):
-    if chat_id in chat_messages:
-        for msg_id in chat_messages[chat_id]:
-            try:
-                await tg_app.bot.delete_message(chat_id, msg_id)
-            except:
-                pass
-        chat_messages[chat_id].clear()
-
-async def fetch_and_send_channels():
+async def build_channel_listing():
+    """Ask Discord for the categories → return list of markdown chunks."""
     guild = discord_client.get_guild(DISCORD_GUILD_ID)
     if not guild:
         return ["❌ Guild not found."]
@@ -93,104 +82,112 @@ async def fetch_and_send_channels():
             continue
         out.append(f"*{cat_name}*")
         for ch in cat.text_channels:
-            out.append(f"• {ch.name}")
+            out.append(f"• `{ch.name}`")
         out.append("")
     if not out:
         return ["⚠️ No matching categories found."]
     full = "\n".join(out)
-    # wrap in preformatted
-    return [f"```{chunk}```" for chunk in split_chunks(full)]
+    return split_chunks(full)
 
-async def do_refresh(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    lock = chat_locks.setdefault(chat_id, asyncio.Lock())
-    async with lock:
-        # delete old messages
-        await cleanup_chat(chat_id)
+async def do_refresh(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Clear old messages, send loading msg, then send the listing + footer/buttons."""
+    bot = ctx.bot
 
-        # loading notice
-        m = await context.bot.send_message(
-            chat_id,
-            "⏳ Loading Model channels please wait, this could take 2–5 mins…"
+    # delete previous messages
+    if chat_id in last_messages:
+        for msg_id in last_messages[chat_id]:
+            try:
+                await bot.delete_message(chat_id, msg_id)
+            except:
+                pass
+    last_messages[chat_id] = []
+
+    # 1) immediate loading notice
+    load = await bot.send_message(
+        chat_id=chat_id,
+        text="⏳ Loading Model channels please wait, this could take 2–5 mins (we have hundreds)…"
+    )
+    last_messages[chat_id].append(load.message_id)
+
+    # 2) fetch & send the actual chunks in a pre block
+    chunks = await build_channel_listing()
+    for idx, chunk in enumerate(chunks):
+        header = "" if idx==0 else "*(continued)*\n"
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=f"```\n{header}{chunk}\n```",
+            parse_mode="MarkdownV2"
         )
-        chat_messages.setdefault(chat_id, []).append(m.message_id)
+        last_messages[chat_id].append(msg.message_id)
 
-        # send categories
-        blocks = await fetch_and_send_channels()
-        for block in blocks:
-            m = await context.bot.send_message(chat_id, block, parse_mode="Markdown")
-            chat_messages[chat_id].append(m.message_id)
+    # 3) footer with last-updated timestamp + buttons
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
+        InlineKeyboardButton("💎 Join VIP", url="https://t.me/YourVIPBotPlaceholder")
+    ]])
+    footer = await bot.send_message(
+        chat_id=chat_id,
+        text=f"Last updated on {ts}\n\nIf your model isn’t listed yet, buy VIP & let us know which one you want added !",
+        reply_markup=keyboard
+    )
+    last_messages[chat_id].append(footer.message_id)
 
-        # footer
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        footer = (
-            "If you don't see the model you want, no worries – when you purchase VIP, "
-            "let us know who you'd like added and we'll get them ASAP!\n\n"
-            f"Last updated: {ts}"
-        )
-        m = await context.bot.send_message(chat_id, footer)
-        chat_messages[chat_id].append(m.message_id)
-
-        # buttons with fallback note
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
-            InlineKeyboardButton("💎 Join VIP", url=VIP_URL),
-        ]])
-        m = await context.bot.send_message(
-            chat_id,
-            "Press 🔄 *Refresh* to update the list. If it doesn’t work, type /start.\n"
-            "Use 💎 *Join VIP* to upgrade.",
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-        chat_messages[chat_id].append(m.message_id)
-
-# handlers
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Handlers
+async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    asyncio.create_task(do_refresh(chat_id, context))
+    await do_refresh(chat_id, ctx)
 
-async def refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def refresh_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     chat_id = update.effective_chat.id
-    asyncio.create_task(do_refresh(chat_id, context))
+    await do_refresh(chat_id, ctx)
 
-async def help_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Press 🔄 *Refresh* or type /start to update the model list.",
-        parse_mode="Markdown"
+        "🤖 I only understand /start and the 🔄 Refresh button to update the model list."
     )
 
+# register with Telegram
 tg_app.add_handler(CommandHandler("start", start_handler))
 tg_app.add_handler(CallbackQueryHandler(refresh_callback, pattern="^refresh$"))
+tg_app.add_handler(
+    # catch any plain‐text message
+    CommandHandler("refresh", lambda u, c: start_handler(u, c))
+)
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, help_prompt))
 
-# Flask webhook
-web = Flask(__name__)
+# ─── Flask webserver for Telegram webhook ─────────────────────────────────
+app = Flask(__name__)
 
-@web.route('/', methods=['GET','HEAD'])
+@app.route('/', methods=['GET', 'HEAD'])
 def home():
     return "🤖 Bot is alive!", 200
 
-@web.route('/webhook', methods=['POST'])
+@app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json(force=True)
-    upd = Update.de_json(data, tg_app.bot)
+    upd  = Update.de_json(data, tg_app.bot)
     tg_app.update_queue.put_nowait(upd)
     return 'OK'
+# ────────────────────────────────────────────────────────────────────────────
 
 async def set_webhook():
     await tg_app.bot.set_webhook(WEBHOOK_URL)
 
 async def main():
+    # Telegram
     await tg_app.initialize()
     await tg_app.start()
     await set_webhook()
+    # Discord
     await discord_client.start(DISCORD_TOKEN)
 
 if __name__ == '__main__':
+    # run Flask in a background thread
     port = int(os.environ.get('PORT', 5000))
     Thread(
-        target=lambda: web.run(host='0.0.0.0', port=port, debug=False),
+        target=lambda: app.run(host='0.0.0.0', port=port, debug=False),
         daemon=True
     ).start()
     asyncio.run(main())

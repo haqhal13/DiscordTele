@@ -31,7 +31,6 @@ logging.info(f"TELEGRAM_BOT_TOKEN: {TELEGRAM_TOKEN[:10]}... (masked)")
 # === Discord Client ===
 intents = discord.Intents.default()
 intents.guilds = True
-intents.channels = True
 discord_client = discord.Client(intents=intents)
 
 @discord_client.event

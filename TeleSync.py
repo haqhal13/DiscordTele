@@ -1,30 +1,20 @@
+```python
 import os
-import logging
-import datetime
-import asyncio
-from dotenv import load_dotenv
 import discord
+import asyncio
 from discord import Intents
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, Bot
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+from flask import Flask, request
+from datetime import datetime
 
-# Load environment variables
-load_dotenv()
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", 0))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-render-app.onrender.com/webhook
+env = os.getenv
+DISCORD_TOKEN = env("DISCORD_TOKEN")
+TELEGRAM_TOKEN = env("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = env("WEBHOOK_URL")  # e.g. https://discordtele.onrender.com
+GUILD_ID = int(env("DISCORD_GUILD_ID"))
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# Discord client setup
-tokens_intents = Intents.default()
-tokens_intents.guilds = True
-
-discord_client = discord.Client(intents=tokens_intents)
-
-# Categories to include
+# Only these categories will be shown
 CATEGORIES_TO_INCLUDE = [
     '📦 ETHNICITY VAULTS',
     '🧔 MALE CREATORS  / AGENCY',
@@ -47,105 +37,81 @@ CATEGORIES_TO_INCLUDE = [
     'Uncatagorised Girls'
 ]
 
-async def fetch_channels_text() -> str:
-    """
-    Fetch and format the channels from Discord according to the included categories.
-    """
-    guild = discord_client.get_guild(GUILD_ID)
-    if guild is None:
-        raise RuntimeError("Guild not found")
+app = Flask(__name__)
 
-    channels = guild.channels
-    by_category = {}
-    for ch in channels:
-        # Only keep text channels
-        if not isinstance(ch, discord.TextChannel):
-            continue
-        cat_name = ch.category.name if ch.category else "Uncategorized"
-        if cat_name not in CATEGORIES_TO_INCLUDE:
-            continue
-        by_category.setdefault(cat_name, []).append(ch.name)
+# Discord client setup
+discord_intents = Intents.default()
+discord_intents.guilds = True
+client = discord.Client(intents=discord_intents)
+
+# Telegram bot setup
+telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+bot = Bot(token=TELEGRAM_TOKEN)
+
+async def fetch_channels_text():
+    guild = client.get_guild(GUILD_ID)
+    categories = sorted(
+        [c for c in guild.categories if c.name in CATEGORIES_TO_INCLUDE],
+        key=lambda c: CATEGORIES_TO_INCLUDE.index(c.name)
+    )
 
     lines = []
-    for cat in CATEGORIES_TO_INCLUDE:
-        names = by_category.get(cat)
-        if not names:
-            continue
-        lines.append(f"<b>📦 {cat}</b>")
-        for name in sorted(names):
-            lines.append(f"• <code>{name}</code>")
-        lines.append("")  # blank line after each category
+    for cat in categories:
+        lines.append(f"📦 <b>{cat.name}</b>")
+        for ch in cat.text_channels:
+            lines.append(f"• {ch.mention}")
+        lines.append("")
 
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    lines.append(f"<i>Updated on {now}</i>")
-    lines.append("
-Press /refresh to update the list.")
+    # footer with timestamp and refresh prompt
+    updated = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    lines.append(f"<i>Updated on {updated}. Press /refresh to update.</i>")
     return "\n".join(lines)
 
-async def send_model_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Delete any previously sent list, post a loading message, fetch channels, then replace with the real list.
-    """
-    chat_id = update.effective_chat.id
-    # Delete the old list if it exists
-    last_msg = context.user_data.get('last_list_msg_id')
-    if last_msg:
-        try:
-            await context.bot.delete_message(chat_id, last_msg)
-        except Exception:
-            pass
-
-    # Send loading notice
-    loading = await context.bot.send_message(chat_id, 
-        "⏳ Fetching Model channels please wait, this could take 2–5 mins…")
+async def send_channel_list(update: Update, context: ContextTypes.DEFAULT_TYPE, initial=False):
+    if initial:
+        await update.message.reply_html(
+            "👋 Hi there! Type /start or /refresh to receive an up-to-date model list."
+        )
+    status = "⏳ Fetching Model channels please wait, this could take 2–5 mins…"
+    if initial:
+        msg = await update.message.reply_text(status)
+    else:
+        msg = await update._bot.send_message(chat_id=update.effective_chat.id, text="🔄 Refreshing…")
 
     try:
         text = await fetch_channels_text()
-        msg = await context.bot.send_message(chat_id, text, parse_mode="HTML")
-        # Save which message to delete next time
-        context.user_data['last_list_msg_id'] = msg.message_id
+        await msg.edit_text(text, parse_mode='HTML', disable_web_page_preview=True)
     except Exception as e:
-        await context.bot.send_message(chat_id, f"❌ Could not fetch channels: {e}")
-    finally:
-        # Remove the loading message
-        try:
-            await context.bot.delete_message(chat_id, loading.message_id)
-        except Exception:
-            pass
+        await msg.edit_text(f"❌ Could not fetch channels: {e}")
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Greet the user and immediately fetch & send the model list.
-    """
-    await update.message.reply_text(
-        "👋 Hi there! Type /start or /refresh to receive an up-to-date model list.")
-    await send_model_list(update, context)
+# Handlers for /start and /refresh
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_channel_list(update, context, initial=True)
 
-async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Explicitly refresh the model list.
-    """
-    await update.message.reply_text("🔄 Refreshing…")
-    await send_model_list(update, context)
+async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_channel_list(update, context, initial=False)
 
-async def run_discord_client():
-    await discord_client.start(DISCORD_TOKEN)
+telegram_app.add_handler(CommandHandler('start', start))
+telegram_app.add_handler(CommandHandler('refresh', refresh))
 
-def main():
-    # Launch Discord client in background
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_discord_client())
-
-    # Build Telegram application
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("refresh", refresh_command))
-
-    # Start webhook listener
-    app.run_webhook(listen="0.0.0.0",
-                    port=int(os.getenv("PORT", 10000)),
-                    url_path="webhook",
-                    webhook_url=WEBHOOK_URL)
+# Flask endpoint for Telegram webhook
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json(force=True)
+    asyncio.create_task(telegram_app.process_update(Update.de_json(data, bot)))
+    return 'OK'
 
 if __name__ == '__main__':
-    main()
+    # set Telegram webhook
+    asyncio.get_event_loop().run_until_complete(bot.set_webhook(WEBHOOK_URL + '/webhook'))
+
+    # start Discord
+    @client.event
+    async def on_ready():
+        print(f"✅ Discord logged in as {client.user} (ID: {client.user.id})")
+
+    # run both Flask and Discord
+    discord_task = asyncio.create_task(client.start(DISCORD_TOKEN))
+    flask_task = asyncio.create_task(app.run_task(host='0.0.0.0', port=int(os.getenv('PORT', '10000'))))
+    asyncio.get_event_loop().run_until_complete(asyncio.gather(discord_task, flask_task))
+```

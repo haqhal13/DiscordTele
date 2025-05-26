@@ -1,26 +1,21 @@
-# TeleSync.py
 import os
-import logging
-import threading
-
-from flask import Flask, request
+import asyncio
 import discord
+from discord.utils import get
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     ContextTypes,
+    CommandHandler,
 )
+from flask import Flask, request, abort
 
-# ────── CONFIG ──────
-DISCORD_TOKEN      = os.environ["DISCORD_TOKEN"]
-DISCORD_GUILD_ID   = int(os.environ["DISCORD_GUILD_ID"])
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-# WEBHOOK_URL should be like "https://myapp.onrender.com"
-WEBHOOK_URL        = os.environ["WEBHOOK_URL"].rstrip("/") + "/webhook"
-PORT               = int(os.environ.get("PORT", "5000"))
+# ── CONFIG ────────────────────────────────────────────────────────────────
+DISCORD_TOKEN     = os.environ['DISCORD_TOKEN']
+DISCORD_GUILD_ID  = int(os.environ['DISCORD_GUILD_ID'])
+TELEGRAM_TOKEN    = os.environ['TELEGRAM_BOT_TOKEN']
+WEBHOOK_URL       = os.environ['WEBHOOK_URL'].rstrip('/') + '/webhook'
 
-# only these categories will be echoed
 CATEGORIES_TO_INCLUDE = [
     '📦 ETHNICITY VAULTS',
     '🧔 MALE CREATORS  / AGENCY',
@@ -42,98 +37,101 @@ CATEGORIES_TO_INCLUDE = [
     '🔞 PORN',
     'Uncatagorised Girls'
 ]
+# ────────────────────────────────────────────────────────────────────────────
 
-# ────── LOGGER ──────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ────── HELPERS ──────
-def chunked(lst, n):
-    """Yield successive n-sized chunks from lst."""
-    for i in range(0, len(lst), n):
-        yield lst[i : i + n]
-
-def escape_md2(text: str) -> str:
-    """Escape just periods for MarkdownV2."""
-    return text.replace(".", r"\.")
-
-# ────── DISCORD CLIENT ──────
+# ── Discord client ─────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.guilds   = True
-intents.messages = False
-discord_client   = discord.Client(intents=intents)
+intents.messages = True
+discord_client = discord.Client(intents=intents)
+# ────────────────────────────────────────────────────────────────────────────
 
-@discord_client.event
-async def on_ready():
-    logger.info(f"✅ Discord logged in as {discord_client.user} (ID {discord_client.user.id})")
+# ── Telegram application ───────────────────────────────────────────────────
+tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+# ────────────────────────────────────────────────────────────────────────────
 
-# ────── TELEGRAM BOT ──────
+
+async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # 1) immediate confirmation
+    await update.message.reply_text(
+        "👋 Getting up to date list please wait 2–5 mins…"
+    )
+
+    # 2) longer-running notice
+    await update.message.reply_text(
+        "⏳ Fetching Model channels please wait, this could take 2–5 mins as we have hundreds…"
+    )
+
+    # 3) actually fetch and reply
+    try:
+        guild = discord_client.get_guild(DISCORD_GUILD_ID)
+        if not guild:
+            await update.message.reply_text("❌ Guild not found.")
+            return
+
+        lines = []
+        for cat_name in CATEGORIES_TO_INCLUDE:
+            # find that category object
+            cat = get(guild.categories, name=cat_name)
+            if not cat:
+                continue
+            lines.append(f"*{cat_name}*")
+            for ch in cat.text_channels:
+                lines.append(f"• {ch.name}")
+            lines.append("")  # blank line between categories
+
+        if not lines:
+            await update.message.reply_text("⚠️ No matching categories found.")
+        else:
+            text = "\n".join(lines).strip()
+            # Use Markdown so the *bold* category names render nicely
+            await update.message.reply_markdown(text)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not fetch channels: {e}")
+
+
+tg_app.add_handler(CommandHandler("start", start_handler))
+# ────────────────────────────────────────────────────────────────────────────
+
+
+# ── Flask webhook receiver ─────────────────────────────────────────────────
 app = Flask(__name__)
-telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+@app.route('/webhook', methods=['POST'])
+def telegram_webhook():
+    if request.method == 'POST':
+        data = request.get_json(force=True)
+        update = Update.de_json(data, tg_app.bot)
+        # queue it for the telegram dispatcher
+        tg_app.update_queue.put_nowait(update)
+        return 'OK'
+    abort(400)
+# ────────────────────────────────────────────────────────────────────────────
 
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) immediate “we’re working” prompt:
-    await update.message.reply_text(
-        "📡 Getting up to date list please wait 2-5 mins…"
-    )
-    # 2) long-fetch warning:
-    await update.message.reply_text(
-        "⏳ Fetching Model channels please wait this could take 2-5 mins as we have hundreds…"
-    )
-
-    # 3) build fresh list
-    output_sections = []
-    guild = discord_client.get_guild(DISCORD_GUILD_ID)
-    if not guild:
-        return await update.message.reply_text("❌ Guild not found.")
-
-    for category in CATEGORIES_TO_INCLUDE:
-        matched = [
-            ch.name
-            for ch in guild.text_channels
-            if ch.category
-            and ch.category.name.strip().lower() == category.strip().lower()
-        ]
-        if matched:
-            lines = "\n".join(f"• {escape_md2(name)}" for name in matched)
-            header = f"*{escape_md2(category)}*"
-            output_sections.append(f"{header}\n{lines}")
-
-    if not output_sections:
-        return await update.message.reply_text("❌ No configured categories found.")
-
-    # 4) send in 5-section chunks so we never exceed Telegram limits
-    for batch in chunked(output_sections, 5):
-        text = "\n\n".join(batch)
-        await update.message.reply_markdown_v2(text)
-
-telegram_app.add_handler(CommandHandler("start", start_handler))
+async def set_telegram_webhook():
+    # await the coroutine so you don't get "never awaited" warnings
+    await tg_app.bot.set_webhook(WEBHOOK_URL)
 
 
-# ────── FLASK WEBHOOK ──────
-@app.route("/", methods=["GET"])
-def index():
-    return "ok"
+async def run_bots():
+    # 1) register webhook
+    await set_telegram_webhook()
+
+    # 2) start discord client (this runs forever)
+    await discord_client.start(DISCORD_TOKEN)
 
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    telegram_app.update_queue.put(update)
-    return "OK"
+if __name__ == '__main__':
+    # 1) start Flask in a background thread
+    from threading import Thread
+    Thread(
+        target=lambda: app.run(
+            host='0.0.0.0',
+            port=int(os.environ.get('PORT', 10000)),
+            debug=False
+        )
+    ).start()
 
-
-def run_webhook():
-    # tell Telegram where to send updates
-    telegram_app.bot.set_webhook(WEBHOOK_URL)
-    # run flask
-    app.run(host="0.0.0.0", port=PORT)
-
-
-# ────── START EVERYTHING ──────
-if __name__ == "__main__":
-    # 1) start webhook + Flask in thread
-    threading.Thread(target=run_webhook, daemon=True).start()
-    # 2) start Discord client (blocking)
-    discord_client.run(DISCORD_TOKEN)
+    # 2) run Telegram webhook setup + Discord client
+    asyncio.run(run_bots())

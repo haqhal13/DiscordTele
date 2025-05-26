@@ -124,11 +124,11 @@ async def do_refresh(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     footer = (
         f"Last updated on {timestamp}\n\n"
-        "If your model isn’t listed yet, buy VIP & let us know which one you want added!"
+        "We have so many more models we couldnt inlcude on the list If a model you want isn’t listed yet, buy VIP & let us know which one you want added and we will do it asap!"
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
-        InlineKeyboardButton("💎 Join VIP", url="https://t.me/YourVIPBotPlaceholder")
+        InlineKeyboardButton("💎 Join VIP", url="https://t.me/HOB_VIP_BOT")
     ]])
     msg = await bot.send_message(chat_id, footer, reply_markup=keyboard)
     new_ids.append(msg.message_id)

@@ -4,10 +4,9 @@ import discord
 import logging
 import traceback
 from flask import Flask
-from telegram import Update, Bot
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from dotenv import load_dotenv
-import threading
 
 # === Load Environment ===
 load_dotenv()
@@ -57,37 +56,20 @@ async def fetch_discord_channels():
                     logging.debug(f"   - Channel: {channel.name} (ID: {channel.id})")
                     result += f"   - {channel.name}\n"
 
-        if not result.strip():
-            logging.warning("⚠️ No channels found.")
-            return "No channels found."
-        return result.strip()
-
+        return result.strip() or "No channels found."
     except Exception as e:
         logging.error("❌ Error in fetch_discord_channels:\n" + traceback.format_exc())
         return "Error: Unable to fetch channels."
 
 # === Telegram Bot ===
-def start(update: Update, context: CallbackContext):
+async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logging.info(f"🚀 /start triggered by {user.username} (ID: {user.id})")
-    update.message.reply_text("Fetching the latest model list... Please wait.")
+    await update.message.reply_text("Fetching the latest model list... Please wait.")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    model_list = loop.run_until_complete(fetch_discord_channels())
-    message = f"📋 Current Model List:\n\n{model_list}\n\n💸 To unlock full access, pay here: {PAYMENT_LINK}"
-    update.message.reply_text(message)
-
-def run_telegram_bot():
-    try:
-        logging.info("🚀 Starting Telegram bot...")
-        updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-        dp = updater.dispatcher
-        dp.add_handler(CommandHandler("start", start))
-        updater.start_polling()
-        updater.idle()
-    except Exception as e:
-        logging.error("❌ Telegram bot error:\n" + traceback.format_exc())
+    model_list = await fetch_discord_channels()
+    message = f"📋 **Current Model List:**\n\n{model_list}\n\n💸 To unlock full access, pay here: {PAYMENT_LINK}"
+    await update.message.reply_text(message, parse_mode="Markdown")
 
 # === Flask Web Service ===
 flask_app = Flask(__name__)
@@ -97,19 +79,24 @@ def home():
     logging.debug("🌐 Flask / endpoint pinged.")
     return "✅ Discord-Telegram Model List Bot is running."
 
-# === Main Runner ===
-def run_discord_bot():
+async def main():
     try:
-        logging.info("🚀 Starting Discord client...")
-        asyncio.run(discord_client.start(DISCORD_TOKEN))
-    except Exception as e:
-        logging.error("❌ Discord client error:\n" + traceback.format_exc())
+        # Start Discord client in background
+        asyncio.create_task(discord_client.start(DISCORD_TOKEN))
 
-def run_flask():
-    logging.info(f"🌐 Starting Flask web server on port {WEB_PORT}...")
-    flask_app.run(host="0.0.0.0", port=WEB_PORT)
+        # Start Telegram bot
+        telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        telegram_app.add_handler(CommandHandler("start", telegram_start))
+        logging.info("✅ Telegram bot ready and waiting for commands.")
+        await telegram_app.run_polling()
+    except Exception as e:
+        logging.error("❌ Error in main async loop:\n" + traceback.format_exc())
 
 if __name__ == "__main__":
-    threading.Thread(target=run_discord_bot).start()
-    threading.Thread(target=run_telegram_bot).start()
-    threading.Thread(target=run_flask).start()
+    import threading
+
+    # Start Flask web server in a thread (optional)
+    threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=WEB_PORT)).start()
+
+    # Start async main loop (Discord + Telegram)
+    asyncio.run(main())

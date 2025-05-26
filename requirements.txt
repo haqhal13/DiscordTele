@@ -1,2 +1,4 @@
 discord.py
-requests
+python-telegram-bot==20.8
+Flask
+python-dotenv

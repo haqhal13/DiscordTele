@@ -7,6 +7,7 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from dotenv import load_dotenv
+import threading
 
 # === Load Environment ===
 load_dotenv()
@@ -67,7 +68,7 @@ async def fetch_discord_channels():
         return "Error: Unable to fetch channels."
 
 # === Telegram Bot Command ===
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = update.effective_user
         logging.info(f"🚀 /start triggered by {user.username} (ID: {user.id})")
@@ -89,31 +90,29 @@ def home():
     logging.debug("🌐 Flask / endpoint pinged.")
     return "✅ Discord-Telegram Model List Bot is running."
 
-# === Main Runner ===
-async def main():
+# === Threaded Functions ===
+def run_discord_bot():
     try:
         logging.info("🚀 Starting Discord client...")
-        asyncio.create_task(discord_client.start(DISCORD_TOKEN))
+        asyncio.run(discord_client.start(DISCORD_TOKEN))
+    except Exception as e:
+        logging.error("❌ Discord client error:\n" + traceback.format_exc())
 
+def run_telegram_bot():
+    try:
         logging.info("🚀 Starting Telegram bot...")
         telegram_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        telegram_app.add_handler(CommandHandler("start", start))
-        logging.info("✅ Telegram bot ready and waiting for commands.")
-        await telegram_app.run_polling()
-
+        telegram_app.add_handler(CommandHandler("start", telegram_start))
+        telegram_app.run_polling()
     except Exception as e:
-        logging.error("❌ Error in main runner:\n" + traceback.format_exc())
+        logging.error("❌ Telegram bot error:\n" + traceback.format_exc())
 
-# === Run Everything ===
+def run_flask():
+    logging.info(f"🌐 Starting Flask web server on port {WEB_PORT}...")
+    flask_app.run(host="0.0.0.0", port=WEB_PORT)
+
+# === Main Runner ===
 if __name__ == "__main__":
-    import threading
-
-    try:
-        logging.info(f"🌐 Starting Flask web server on port {WEB_PORT}...")
-        threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=WEB_PORT)).start()
-
-        logging.info("🚀 Launching main async tasks...")
-        asyncio.run(main())
-
-    except Exception as e:
-        logging.error("❌ Fatal Error:\n" + traceback.format_exc())
+    threading.Thread(target=run_discord_bot).start()
+    threading.Thread(target=run_telegram_bot).start()
+    threading.Thread(target=run_flask).start()

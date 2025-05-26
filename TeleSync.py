@@ -47,10 +47,12 @@ intents = discord.Intents.default()
 intents.guilds = True
 client = discord.Client(intents=intents)
 
+# Create a single event loop for Discord
+discord_loop = asyncio.new_event_loop()
+
 def start_discord_loop():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(client.start(DISCORD_TOKEN))
+    asyncio.set_event_loop(discord_loop)
+    discord_loop.run_until_complete(client.start(DISCORD_TOKEN))
 
 @client.event
 async def on_ready():
@@ -77,12 +79,13 @@ async def fetch_discord_channels():
     return output.strip() or "No channels found."
 
 # === Telegram handler ===
+
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
     logging.info(f"🚀 /start triggered by {user.username} ({user.id})")
     update.message.reply_text("⏳ Fetching latest model list...")
     try:
-        future = fetch_future = asyncio.run_coroutine_threadsafe(fetch_discord_channels(), discord_loop)
+        future = asyncio.run_coroutine_threadsafe(fetch_discord_channels(), discord_loop)
         data = future.result(timeout=30)
         msg = f"📋 **Model List:**\n\n{data}\n\n💸 Pay here: https://t.me/YourPaymentBot"
         update.message.reply_text(msg, parse_mode="Markdown")
@@ -101,7 +104,6 @@ def home():
 # === Main entrypoint ===
 if __name__ == '__main__':
     # Start Discord in its own thread/event loop
-    discord_loop = asyncio.new_event_loop()
     threading.Thread(target=start_discord_loop, daemon=True).start()
 
     # Start Flask server for health checks
@@ -110,7 +112,7 @@ if __name__ == '__main__':
     # Initialize Telegram bot (PTB v13)
     updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
     dispatcher = updater.dispatcher
-    # Remove any existing webhook and start polling
+    # Clear any previous webhook and start polling
     updater.bot.delete_webhook()
     logging.info("✅ Cleared previous Telegram webhook; switching to polling.")
     dispatcher.add_handler(CommandHandler('start', start_command))

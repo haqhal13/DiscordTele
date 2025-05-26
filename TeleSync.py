@@ -1,20 +1,30 @@
+#!/usr/bin/env python3
 import os
-import threading
+import asyncio
+import logging
 from datetime import datetime
-from flask import Flask, request
+from dotenv import load_dotenv
+
 import discord
 from discord import Intents
-from telegram import Bot, Update
-from telegram.ext import CommandHandler, CallbackContext
-from telegram.ext.dispatcher import Dispatcher
 
-# ─── Configuration ─────────────────────────────────────────────────────────────
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
+# ─── Config & Logging ─────────────────────────────────────────────────────────
+
+load_dotenv()
 DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-WEBHOOK_URL     = os.environ["WEBHOOK_URL"]   # e.g. https://myapp.example.com
-GUILD_ID        = int(os.environ["GUILD_ID"])
-PORT            = int(os.environ.get("PORT", "10000"))
+WEBHOOK_URL     = os.environ["WEBHOOK_URL"]    # e.g. https://your-domain.com
+GUILD_ID        = int(os.environ["GUILD_ID"])  # your Discord guild ID
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 CATEGORIES_TO_INCLUDE = [
     '📦 ETHNICITY VAULTS',
@@ -38,95 +48,132 @@ CATEGORIES_TO_INCLUDE = [
     'Uncatagorised Girls'
 ]
 
-# ─── Discord client ────────────────────────────────────────────────────────────
+# keep track of the last‐sent Telegram messages for each chat, so we can delete them
+_last_messages: dict[int, list[int]] = {}
+
+# ─── Discord Client Setup ────────────────────────────────────────────────────
 
 intents = Intents.default()
 intents.guilds = True
 discord_client = discord.Client(intents=intents)
 
-@discord_client.event
-async def on_ready():
-    print(f"✅ Discord logged in as {discord_client.user}")
-
-# ─── Telegram setup ─────────────────────────────────────────────────────────────
-
-bot        = Bot(token=TELEGRAM_TOKEN)
-dispatcher = Dispatcher(bot, None, 0)   # v20: import from telegram.ext.dispatcher
-
-app        = Flask(__name__)
-last_list  = {}  # chat_id → message_id
-
-def fetch_and_send(chat_id):
-    # delete old
-    old = last_list.get(chat_id)
-    if old:
-        try: bot.delete_message(chat_id, old)
-        except: pass
-
+async def fetch_model_list() -> str:
+    """Fetch and format the channels from Discord categories we care about."""
     guild = discord_client.get_guild(GUILD_ID)
-    if not guild:
-        bot.send_message(chat_id, "❌ Guild not found.")
-        return
-
-    parts = []
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    parts.append(f"📅 <b>Updated:</b> {now}\n")
-    for name in CATEGORIES_TO_INCLUDE:
-        cat = discord.utils.get(guild.categories, name=name)
-        if not cat: continue
-        emoji = name.split()[0]
-        parts.append(f"{emoji} <b>{name[len(emoji)+1:]}:</b>")
+    if guild is None:
+        await discord_client.wait_until_ready()
+        guild = discord_client.get_guild(GUILD_ID)
+    lines: list[str] = []
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    lines.append(f"*Model channels list (updated {ts})*\n")
+    for cat in guild.categories:
+        if cat.name not in CATEGORIES_TO_INCLUDE:
+            continue
+        # Extract the emoji at the start of the category name:
+        emoji, _, rest = cat.name.partition(" ")
+        lines.append(f"{emoji} *{rest}*")
         for ch in cat.channels:
             if isinstance(ch, discord.TextChannel):
-                parts.append(f"• {emoji}|<code>{ch.name}</code>")
-        parts.append("")
+                lines.append(f"• `{ch.name}`")
+        lines.append("")  # blank line between categories
+    return "\n".join(lines)
 
-    parts.append("Press <b>/refresh</b> to update again.")
-    text = "\n".join(parts)
+# ─── Telegram Handlers ───────────────────────────────────────────────────────
 
-    # split if >4k chars
-    for chunk in (text[i:i+3900] for i in range(0, len(text), 3900)):
-        msg = bot.send_message(chat_id, chunk, parse_mode="HTML")
-    last_list[chat_id] = msg.message_id
+async def _delete_old(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if chat_id in _last_messages:
+        for msg_id in _last_messages[chat_id]:
+            try:
+                await context.bot.delete_message(chat_id, msg_id)
+            except Exception:
+                pass
+        _last_messages.pop(chat_id, None)
 
-def cmd_start(update: Update, context: CallbackContext):
-    cid = update.effective_chat.id
-    bot.send_message(
-        cid,
-        "👋 Hi there! Type <b>/start</b> or <b>/refresh</b> to get an up-to-date model list.",
-        parse_mode="HTML"
+async def _send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    text = await fetch_model_list()
+    # split into ~4 000-char chunks
+    parts: list[str] = []
+    curr = ""
+    for line in text.split("\n"):
+        if len(curr) + len(line) + 1 > 4000:
+            parts.append(curr)
+            curr = line + "\n"
+        else:
+            curr += line + "\n"
+    if curr:
+        parts.append(curr)
+
+    # delete anything we sent previously
+    await _delete_old(chat_id, context)
+
+    sent_ids: list[int] = []
+    for part in parts:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=part,
+            parse_mode="MarkdownV2",
+            disable_web_page_preview=True,
+        )
+        sent_ids.append(msg.message_id)
+
+    # footer with refresh hint
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    footer = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(f"Our list is above (updated {ts}).\n"
+              f"Press /refresh to get the latest."),
     )
-    bot.send_message(
-        cid,
-        "⏳ Fetching Model channels please wait, this could take 2–5 mins…",
-        parse_mode="HTML"
+    sent_ids.append(footer.message_id)
+
+    # remember them so we can delete on next refresh
+    _last_messages[chat_id] = sent_ids
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    # greeting + instructions
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="👋 Hi there! Type /start or /refresh to receive an up-to-date model list."
     )
-    threading.Thread(target=fetch_and_send, args=(cid,), daemon=True).start()
+    # fetching notice
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏳ Fetching Model channels, please wait—this could take 2–5 mins…"
+    )
+    await _send_list(chat_id, context)
 
-def cmd_refresh(update: Update, context: CallbackContext):
-    cid = update.effective_chat.id
-    bot.send_message(cid, "🔄 Refreshing…", parse_mode="HTML")
-    threading.Thread(target=fetch_and_send, args=(cid,), daemon=True).start()
+async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="🔄 Refreshing…"
+    )
+    await _send_list(chat_id, context)
 
-dispatcher.add_handler(CommandHandler("start",   cmd_start))
-dispatcher.add_handler(CommandHandler("refresh", cmd_refresh))
+# ─── Bootstrap & Run ────────────────────────────────────────────────────────
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-    update = Update.de_json(data, bot)
-    dispatcher.process_update(update)
-    return "OK"
+async def main():
+    # kick off Discord
+    asyncio.create_task(discord_client.start(DISCORD_TOKEN))
+
+    # build and configure our Telegram app
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+    app.add_handler(CommandHandler("start",   start_cmd))
+    app.add_handler(CommandHandler("refresh", refresh_cmd))
+
+    # set Telegram webhook to /webhook
+    await app.bot.set_webhook(WEBHOOK_URL + "/webhook")
+
+    # run the webhook listener (this includes its own built-in webserver)
+    await app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 8443)),
+        webhook_path="/webhook",
+    )
 
 if __name__ == "__main__":
-    # set telegram webhook
-    bot.delete_webhook()
-    bot.set_webhook(f"{WEBHOOK_URL}/webhook")
-
-    # run flask in background, then discord
-    threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=PORT),
-        daemon=True
-    ).start()
-
-    discord_client.run(DISCORD_TOKEN)
+    asyncio.run(main())

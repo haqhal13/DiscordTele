@@ -12,7 +12,6 @@ from telegram.ext import (
 )
 from flask import Flask, request
 from threading import Thread
-from datetime import datetime
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 DISCORD_TOKEN    = os.environ['DISCORD_TOKEN']
@@ -20,7 +19,6 @@ DISCORD_GUILD_ID = int(os.environ['DISCORD_GUILD_ID'])
 TELEGRAM_TOKEN   = os.environ['TELEGRAM_BOT_TOKEN']
 WEBHOOK_URL      = os.environ['WEBHOOK_URL'].rstrip('/') + '/webhook'
 
-# only these categories will be fetched
 CATEGORIES_TO_INCLUDE = [
     '📦 ETHNICITY VAULTS',
     '🧔 MALE CREATORS  / AGENCY',
@@ -55,10 +53,8 @@ tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 # ────────────────────────────────────────────────────────────────────────────
 
 def split_chunks(text: str, limit: int = 4000):
-    """Split a long string into Telegram-safe chunks (≤ limit chars), by line."""
     lines = text.splitlines(keepends=True)
-    chunks = []
-    current = ""
+    chunks, current = [], ""
     for line in lines:
         if len(current) + len(line) > limit:
             chunks.append(current)
@@ -69,24 +65,11 @@ def split_chunks(text: str, limit: int = 4000):
         chunks.append(current)
     return chunks
 
-async def delete_previous(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
-    ids = ctx.user_data.get('last_message_ids', [])
-    for msg_id in ids:
-        try:
-            await ctx.bot.delete_message(chat_id, msg_id)
-        except:
-            pass
-    ctx.user_data['last_message_ids'] = []
-
 async def fetch_and_send_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Fetch only desired categories, then send as markdown in safe-sized chunks."""
-    sent_ids = []
     try:
         guild = discord_client.get_guild(DISCORD_GUILD_ID)
         if not guild:
-            m = await update.message.reply_text("❌ Guild not found.")
-            sent_ids.append(m.message_id)
-            return sent_ids
+            return await update.message.reply_text("❌ Guild not found.")
 
         out = []
         for cat_name in CATEGORIES_TO_INCLUDE:
@@ -99,20 +82,71 @@ async def fetch_and_send_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             out.append("")
 
         if not out:
-            m = await update.message.reply_text("⚠️ No matching categories found.")
-            sent_ids.append(m.message_id)
-            return sent_ids
+            return await update.message.reply_text("⚠️ No matching categories found.")
 
         full = "\n".join(out)
         for i, chunk in enumerate(split_chunks(full)):
             prefix = "*(continued)*\n" if i>0 else ""
-            m = await update.message.reply_markdown(prefix + chunk)
-            sent_ids.append(m.message_id)
+            await update.message.reply_markdown(prefix + chunk)
 
     except Exception as e:
-        m = await update.message.reply_text(f"❌ Could not fetch channels: {e}")
-        sent_ids.append(m.message_id)
+        await update.message.reply_text(f"❌ Could not fetch channels: {e}")
 
-    return sent_ids
+async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Hi there! Type /start or /refresh to receive an up-to-date model list."
+    )
+    await update.message.reply_text(
+        "⏳ Fetching Model channels please wait, this could take 2–5 mins…"
+    )
+    await fetch_and_send_channels(update, ctx)
 
-# /start
+async def refresh_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔄 Refreshing…")
+    await fetch_and_send_channels(update, ctx)
+
+async def help_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 I only understand /start and /refresh to fetch the model list."
+    )
+
+tg_app.add_handler(CommandHandler("start", start_handler))
+tg_app.add_handler(CommandHandler("refresh", refresh_handler))
+tg_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, help_prompt)
+)
+
+# ─── Flask webserver for webhook ───────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route('/', methods=['GET', 'HEAD'])
+def home():
+    return "🤖 Bot is alive!", 200
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json(force=True)
+    upd  = Update.de_json(data, tg_app.bot)
+    tg_app.update_queue.put_nowait(upd)
+    return 'OK'
+
+async def set_webhook():
+    await tg_app.bot.set_webhook(WEBHOOK_URL)
+
+async def main():
+    # start Telegram side
+    await tg_app.initialize()
+    await tg_app.start()
+    await set_webhook()
+
+    # then Discord
+    await discord_client.start(DISCORD_TOKEN)
+
+if __name__ == '__main__':
+    # Render injects $PORT; default to 5000 locally
+    port = int(os.environ.get('PORT', 5000))
+    Thread(
+        target=lambda: app.run(host='0.0.0.0', port=port, debug=False),
+        daemon=True
+    ).start()
+    asyncio.run(main())

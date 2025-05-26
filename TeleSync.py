@@ -20,8 +20,9 @@ from telegram.ext import (
 load_dotenv()
 DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-WEBHOOK_URL     = os.environ["WEBHOOK_URL"]    # e.g. https://your-domain.com
-GUILD_ID        = int(os.environ["GUILD_ID"])  # your Discord guild ID
+WEBHOOK_URL     = os.environ["WEBHOOK_URL"]    # e.g. https://your-app.onrender.com
+PORT            = int(os.environ.get("PORT", 8443))
+GUILD_ID        = int(os.environ["GUILD_ID"])
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,22 +49,24 @@ CATEGORIES_TO_INCLUDE = [
     'Uncatagorised Girls'
 ]
 
+# Tracks the last batch of Telegram message_ids per chat so we can delete them
 _last_messages: dict[int, list[int]] = {}
 
-# ─── Discord Client Setup ────────────────────────────────────────────────────
+# ─── Discord Client ───────────────────────────────────────────────────────────
 
 intents = Intents.default()
 intents.guilds = True
 discord_client = discord.Client(intents=intents)
 
 async def fetch_model_list() -> str:
+    """Fetch & format the channels under each included category."""
     guild = discord_client.get_guild(GUILD_ID)
     if guild is None:
+        # wait until cache is ready
         await discord_client.wait_until_ready()
         guild = discord_client.get_guild(GUILD_ID)
-    lines: list[str] = []
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    lines.append(f"*Model channels list (updated {ts})*\n")
+    lines = [f"*Model channels (updated {ts})*\n"]
     for cat in guild.categories:
         if cat.name not in CATEGORIES_TO_INCLUDE:
             continue
@@ -72,89 +75,98 @@ async def fetch_model_list() -> str:
         for ch in cat.channels:
             if isinstance(ch, discord.TextChannel):
                 lines.append(f"• `{ch.name}`")
-        lines.append("")
+        lines.append("")  # blank line between cats
     return "\n".join(lines)
 
-# ─── Telegram Helpers ────────────────────────────────────────────────────────
+# ─── Telegram Helpers ─────────────────────────────────────────────────────────
 
-async def _delete_old(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    if chat_id in _last_messages:
-        for msg_id in _last_messages[chat_id]:
-            try:
-                await context.bot.delete_message(chat_id, msg_id)
-            except:
-                pass
-        _last_messages.pop(chat_id, None)
+async def _delete_old(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Delete the previous list messages, if any."""
+    ids = _last_messages.pop(chat_id, [])
+    for m_id in ids:
+        try:
+            await ctx.bot.delete_message(chat_id, m_id)
+        except:
+            pass
 
-async def _send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def _send_list(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Fetch, split (<=4k chars), send, and record the sent message_ids."""
     text = await fetch_model_list()
     parts, curr = [], ""
     for line in text.split("\n"):
-        if len(curr) + len(line) + 1 > 4000:
+        # split into chunks under Telegram's ~4000-char limit
+        if len(curr) + len(line) + 1 > 3900:
             parts.append(curr); curr = line + "\n"
         else:
             curr += line + "\n"
     if curr: parts.append(curr)
 
-    await _delete_old(chat_id, context)
-    sent_ids: list[int] = []
+    await _delete_old(chat_id, ctx)
+    sent_ids = []
     for part in parts:
-        msg = await context.bot.send_message(
+        msg = await ctx.bot.send_message(
             chat_id=chat_id,
             text=part,
             parse_mode="MarkdownV2",
-            disable_web_page_preview=True,
+            disable_web_page_preview=True
         )
         sent_ids.append(msg.message_id)
 
+    # footer with refresh hint
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    footer = await context.bot.send_message(
+    footer = await ctx.bot.send_message(
         chat_id=chat_id,
         text=(
             f"Our list is above (updated {ts}).\n"
-            "Press /refresh to get the latest."
-        ),
+            "Press /refresh again to update."
+        )
     )
     sent_ids.append(footer.message_id)
     _last_messages[chat_id] = sent_ids
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="👋 Hi there! Type /start or /refresh to receive an up-to-date model list."
-    )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="⏳ Fetching Model channels, please wait—this could take 2–5 mins…"
-    )
-    await _send_list(chat_id, context)
+# ─── Command Handlers ────────────────────────────────────────────────────────
 
-async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await context.bot.send_message(chat_id=chat_id, text="🔄 Refreshing…")
-    await _send_list(chat_id, context)
+async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    # initial welcome & fetch notice
+    await ctx.bot.send_message(
+        chat_id=cid,
+        text=(
+            "👋 Hi! Type /start or /refresh to get the latest model list.\n"
+            "⏳ Fetching Model channels… this could take 2–5 mins."
+        )
+    )
+    await _send_list(cid, ctx)
 
-# ─── Bootstrap & Run ────────────────────────────────────────────────────────
+async def refresh_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    await ctx.bot.send_message(chat_id=cid, text="🔄 Refreshing list…")
+    await _send_list(cid, ctx)
+
+# ─── Main Entrypoint ─────────────────────────────────────────────────────────
 
 async def main():
+    # start Discord in background
     asyncio.create_task(discord_client.start(DISCORD_TOKEN))
 
+    # build Telegram app
     app = (ApplicationBuilder()
            .token(TELEGRAM_TOKEN)
            .build())
-    app.add_handler(CommandHandler("start",   start_cmd))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
 
-    # point Telegram at our webhook endpoint
+    # configure Telegram webhook endpoint
     await app.bot.set_webhook(WEBHOOK_URL + "/webhook")
 
-    # run the webhook listener—note `url_path`, not `webhook_path`
-    await app.run_webhook(
+    # start listening for Telegram webhooks…
+    await app.start_webhook(
         listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 8443)),
-        url_path="/webhook",
+        port=PORT,
+        webhook_path="/webhook"
     )
+    # …and keep the process alive
+    await app.idle()
 
 if __name__ == "__main__":
     asyncio.run(main())

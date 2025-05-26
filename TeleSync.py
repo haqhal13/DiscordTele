@@ -10,14 +10,14 @@ import discord
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
+# ─── CONFIG ────────────────────────────────────────────────────────────────
 DISCORD_TOKEN    = os.environ["DISCORD_TOKEN"]
 DISCORD_GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-WEBHOOK_URL      = os.environ["WEBHOOK_URL"]     # e.g. https://discordtele.onrender.com
+WEBHOOK_URL      = os.environ["WEBHOOK_URL"]  # e.g. https://discordtele.onrender.com
 PORT             = int(os.environ.get("PORT", 3000))
 
-# ─── DISCORD CLIENT ──────────────────────────────────────────────────────────
+# ─── DISCORD CLIENT ────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.guilds = True
 discord_client = discord.Client(intents=intents)
@@ -30,16 +30,29 @@ async def fetch_discord_channels() -> str:
     guild = discord_client.get_guild(DISCORD_GUILD_ID)
     if not guild:
         return "❌ Discord guild not found!"
-    parts = []
+    lines = []
     for cat in guild.categories:
-        lines = [f"{cat.name}:"]
-        for txt in cat.text_channels:
-            lines.append(f"  • {txt.name}")
-        parts.append("\n".join(lines))
-    return "\n\n".join(parts) or "_No channels found_"
+        lines.append(f"{cat.name}:")
+        for ch in cat.text_channels:
+            lines.append(f"  • {ch.name}")
+        lines.append("")  # blank between categories
+    return "\n".join(lines).strip()
 
-# ─── TELEGRAM BOT ────────────────────────────────────────────────────────────
+# ─── TELEGRAM BOT ──────────────────────────────────────────────────────────
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+def chunk_text(text: str, max_len: int=4000):
+    """Yield successive chunks ≤ max_len, cutting on newline."""
+    while text:
+        if len(text) <= max_len:
+            yield text
+            break
+        # find last newline before max_len
+        cut = text.rfind("\n", 0, max_len)
+        if cut == -1:
+            cut = max_len
+        yield text[:cut]
+        text = text[cut:].lstrip("\n")
 
 async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logging.info(f"🚀 /start by {update.effective_user.id}")
@@ -47,16 +60,16 @@ async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         raw = await fetch_discord_channels()
         safe = html.escape(raw)
-        await update.message.reply_html(
-            f"<b>Guild Channels:</b>\n<pre>{safe}</pre>"
-        )
+        for chunk in chunk_text(safe):
+            # wrap each chunk in a <pre> block
+            await update.message.reply_html(f"<pre>{chunk}</pre>")
     except Exception:
         logging.exception("Failed to fetch channels")
         await update.message.reply_text("❌ Could not fetch channels.")
 
 app.add_handler(CommandHandler("start", start_handler))
 
-# ─── FLASK WEBHOOK SERVER ────────────────────────────────────────────────────
+# ─── FLASK WEBHOOK SERVER ─────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -69,7 +82,6 @@ def telegram_webhook():
         return abort(400)
     data = request.get_json(force=True)
     upd = Update.de_json(data, app.bot)
-    logging.debug(f"🔔 Incoming update: {upd}")
     app.update_queue.put_nowait(upd)
     return "OK", 200
 
@@ -77,25 +89,21 @@ def run_flask():
     logging.info(f"🌐 Flask starting on port {PORT}")
     flask_app.run(host="0.0.0.0", port=PORT)
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ─── MAIN ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
-    # 1) Start Flask in background
     Thread(target=run_flask, daemon=True).start()
 
     async def main():
-        # 2) Run Discord
         asyncio.create_task(discord_client.start(DISCORD_TOKEN))
         logging.info("🚀 Discord client started")
 
-        # 3) Initialize & start Telegram webhook dispatcher
         await app.initialize()
         await app.start()
         logging.info("🚀 Telegram webhook initialized")
 
-        # 4) Hang forever
         await asyncio.Event().wait()
 
     asyncio.run(main())

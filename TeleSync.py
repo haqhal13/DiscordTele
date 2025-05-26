@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import html
 from threading import Thread
 
 from flask import Flask, request, abort
@@ -19,7 +20,6 @@ PORT             = int(os.environ.get("PORT", 3000))
 # ─── DISCORD CLIENT ──────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.guilds = True
-
 discord_client = discord.Client(intents=intents)
 
 @discord_client.event
@@ -32,9 +32,9 @@ async def fetch_discord_channels() -> str:
         return "❌ Discord guild not found!"
     parts = []
     for cat in guild.categories:
-        lines = [f"*{cat.name}*"]
+        lines = [f"{cat.name}:"]
         for txt in cat.text_channels:
-            lines.append(f"  • `{txt.name}`")
+            lines.append(f"  • {txt.name}")
         parts.append("\n".join(lines))
     return "\n\n".join(parts) or "_No channels found_"
 
@@ -45,8 +45,11 @@ async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logging.info(f"🚀 /start by {update.effective_user.id}")
     await update.message.reply_text("⏳ Fetching Discord channels…")
     try:
-        text = await fetch_discord_channels()
-        await update.message.reply_markdown_v2(f"*Guild Channels:*\n\n{text}")
+        raw = await fetch_discord_channels()
+        safe = html.escape(raw)
+        await update.message.reply_html(
+            f"<b>Guild Channels:</b>\n<pre>{safe}</pre>"
+        )
     except Exception:
         logging.exception("Failed to fetch channels")
         await update.message.reply_text("❌ Could not fetch channels.")
@@ -65,10 +68,9 @@ def telegram_webhook():
     if request.headers.get("content-type") != "application/json":
         return abort(400)
     data = request.get_json(force=True)
-    update = Update.de_json(data, app.bot)
-    logging.debug(f"🔔 Incoming update: {update}")
-    # push into PTB's queue
-    app.update_queue.put_nowait(update)
+    upd = Update.de_json(data, app.bot)
+    logging.debug(f"🔔 Incoming update: {upd}")
+    app.update_queue.put_nowait(upd)
     return "OK", 200
 
 def run_flask():
@@ -77,22 +79,23 @@ def run_flask():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
 
-    # 1) Start Flask in a thread
+    # 1) Start Flask in background
     Thread(target=run_flask, daemon=True).start()
 
     async def main():
-        # 2) Start Discord
+        # 2) Run Discord
         asyncio.create_task(discord_client.start(DISCORD_TOKEN))
         logging.info("🚀 Discord client started")
 
         # 3) Initialize & start Telegram webhook dispatcher
         await app.initialize()
-        await app.start()  
+        await app.start()
         logging.info("🚀 Telegram webhook initialized")
 
-        # 4) Keep the loop alive forever
+        # 4) Hang forever
         await asyncio.Event().wait()
 
     asyncio.run(main())

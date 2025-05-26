@@ -57,6 +57,7 @@ discord_client = discord.Client(intents=intents)
 tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 # ────────────────────────────────────────────────────────────────────────────
 
+# per-chat locks & message tracking
 chat_locks = {}
 chat_messages = {}
 
@@ -65,8 +66,7 @@ def split_chunks(text: str, limit: int = 4000):
     chunks, current = [], ""
     for line in lines:
         if len(current) + len(line) > limit:
-            chunks.append(current)
-            current = line
+            chunks.append(current); current = line
         else:
             current += line
     if current:
@@ -82,7 +82,7 @@ async def cleanup_chat(chat_id: int):
                 pass
         chat_messages[chat_id].clear()
 
-async def fetch_and_send_channels(chat_id: int):
+async def fetch_and_send_channels():
     guild = discord_client.get_guild(DISCORD_GUILD_ID)
     if not guild:
         return ["❌ Guild not found."]
@@ -98,23 +98,29 @@ async def fetch_and_send_channels(chat_id: int):
     if not out:
         return ["⚠️ No matching categories found."]
     full = "\n".join(out)
+    # wrap in preformatted
     return [f"```{chunk}```" for chunk in split_chunks(full)]
 
 async def do_refresh(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     lock = chat_locks.setdefault(chat_id, asyncio.Lock())
     async with lock:
+        # delete old messages
         await cleanup_chat(chat_id)
+
+        # loading notice
         m = await context.bot.send_message(
             chat_id,
             "⏳ Loading Model channels please wait, this could take 2–5 mins…"
         )
         chat_messages.setdefault(chat_id, []).append(m.message_id)
 
-        blocks = await fetch_and_send_channels(chat_id)
+        # send categories
+        blocks = await fetch_and_send_channels()
         for block in blocks:
-            m = await context.bot.send_message(chat_id, block, parse_mode="MarkdownV2")
+            m = await context.bot.send_message(chat_id, block, parse_mode="Markdown")
             chat_messages[chat_id].append(m.message_id)
 
+        # footer
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         footer = (
             "If you don't see the model you want, no worries – when you purchase VIP, "
@@ -124,17 +130,21 @@ async def do_refresh(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         m = await context.bot.send_message(chat_id, footer)
         chat_messages[chat_id].append(m.message_id)
 
+        # buttons with fallback note
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
             InlineKeyboardButton("💎 Join VIP", url=VIP_URL),
         ]])
         m = await context.bot.send_message(
             chat_id,
-            "Use the buttons below at any time:",
+            "Press 🔄 *Refresh* to update the list. If it doesn’t work, type /start.\n"
+            "Use 💎 *Join VIP* to upgrade.",
+            parse_mode="Markdown",
             reply_markup=kb
         )
         chat_messages[chat_id].append(m.message_id)
 
+# handlers
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     asyncio.create_task(do_refresh(chat_id, context))
@@ -146,16 +156,18 @@ async def refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 I only understand /start or pressing the “Refresh” button to update the model list."
+        "🤖 Press 🔄 *Refresh* or type /start to update the model list.",
+        parse_mode="Markdown"
     )
 
 tg_app.add_handler(CommandHandler("start", start_handler))
 tg_app.add_handler(CallbackQueryHandler(refresh_callback, pattern="^refresh$"))
 tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, help_prompt))
 
+# Flask webhook
 web = Flask(__name__)
 
-@web.route('/', methods=['GET', 'HEAD'])
+@web.route('/', methods=['GET','HEAD'])
 def home():
     return "🤖 Bot is alive!", 200
 
@@ -177,5 +189,8 @@ async def main():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    Thread(target=lambda: web.run(host='0.0.0.0', port=port, debug=False), daemon=True).start()
+    Thread(
+        target=lambda: web.run(host='0.0.0.0', port=port, debug=False),
+        daemon=True
+    ).start()
     asyncio.run(main())

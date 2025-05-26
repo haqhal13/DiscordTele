@@ -68,7 +68,7 @@ def split_chunks(text: str, limit: int = 4000):
     return chunks
 
 async def clear_previous(chat_data, bot, chat_id):
-    """Delete all messages tracked in chat_data['msgs']."""
+    """Delete all messages we previously sent in this chat."""
     for msg_id in chat_data.get('msgs', []):
         try:
             await bot.delete_message(chat_id, msg_id)
@@ -77,20 +77,24 @@ async def clear_previous(chat_data, bot, chat_id):
     chat_data['msgs'] = []
 
 async def fetch_and_send_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    # figure out chat_id & bot
+    if update.callback_query:
+        chat_id = update.callback_query.message.chat.id
+    else:
+        chat_id = update.effective_chat.id
     bot = ctx.bot
 
-    # clear prior messages
+    # clear old
     await clear_previous(ctx.chat_data, bot, chat_id)
 
-    # 1) instant loading message
+    # 1) send loading
     loading = await bot.send_message(
         chat_id,
         "⏳ Loading Model channels please wait, this could take 2–5 mins… we have hundreds"
     )
     ctx.chat_data.setdefault('msgs', []).append(loading.message_id)
 
-    # 2) fetch
+    # 2) build & send list
     try:
         guild = discord_client.get_guild(DISCORD_GUILD_ID)
         if not guild:
@@ -127,14 +131,16 @@ async def fetch_and_send_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         err = await bot.send_message(chat_id, f"❌ Could not fetch channels: {e}")
         ctx.chat_data['msgs'].append(err.message_id)
 
-    # 3) footer with last-updated and refresh button
+    # 3) footer + refresh button
     last_updated = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Refresh", callback_data="refresh")
     ]])
     footer = await bot.send_message(
         chat_id,
-        f"If you don’t see the model you want, no worries – once you purchase VIP let us know who you want and we’ll get them added ASAP!\n\n_List last updated: {last_updated}_",
+        ("If you don’t see the model you want, no worries – once you purchase VIP let us know who you want "
+         "and we’ll get them added ASAP!\n\n"
+         f"_List last updated: {last_updated}_"),
         parse_mode="Markdown",
         reply_markup=keyboard
     )
@@ -144,20 +150,21 @@ async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await fetch_and_send_channels(update, ctx)
 
 async def refresh_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # callback from inline button
-    await update.callback_query.answer()  # acknowledge
-    await fetch_and_send_channels(update.callback_query, ctx)
+    # ack the button (safely)
+    try:
+        await update.callback_query.answer()
+    except:
+        pass
+    await fetch_and_send_channels(update, ctx)
 
 async def help_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 I only understand /start or using the Refresh button to fetch the model list."
+        "🤖 I only understand /start or the Refresh button to fetch the model list."
     )
 
 tg_app.add_handler(CommandHandler("start", start_handler))
 tg_app.add_handler(CallbackQueryHandler(refresh_callback, pattern="^refresh$"))
-tg_app.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, help_prompt)
-)
+tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, help_prompt))
 
 # ─── Flask webserver for webhook ───────────────────────────────────────────
 app = Flask(__name__)
@@ -177,11 +184,11 @@ async def set_webhook():
     await tg_app.bot.set_webhook(WEBHOOK_URL)
 
 async def main():
-    # start Telegram
+    # Telegram side
     await tg_app.initialize()
     await tg_app.start()
     await set_webhook()
-    # then Discord
+    # Discord side
     await discord_client.start(DISCORD_TOKEN)
 
 if __name__ == '__main__':
